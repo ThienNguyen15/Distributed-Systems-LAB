@@ -1,0 +1,240 @@
+docker network create
+
+docker network rm
+
+docker-compose up -d
+docker-compose logs -f kafka
+
+docker-compose down
+docker-compose down --volumes
+docker image prune -a
+docker volume prune
+docker builder prune
+
+Ctrl + D
+########################################################################################
+HDFS and Spark
+
+docker cp "C:\GIT\Distributed Systems LAB\LAB2_DS\FPT-2018-12-02.log" namenode:/tmp/FPT-2018-12-02.log
+
+docker cp "C:\GIT\Distributed Systems LAB\LAB2_DS\IPDict.csv" namenode:/tmp/IPDict.csv
+
+docker exec -it namenode bash
+hdfs dfs -mkdir /logs
+hdfs dfs -ls /
+
+ls /tmp
+
+hdfs dfs -put /tmp/FPT-2018-12-02.log /logs/
+hdfs dfs -put /tmp/IPDict.csv /logs/
+
+hdfs dfs -ls /logs
+
+docker exec -it spark-master bash
+spark-shell
+
+val data = sc.textFile("hdfs://namenode:9000/logs/FPT-2018-12-02.log")
+
+########################################################################################
+docker-compose down
+docker-compose up -d
+
+docker exec -it namenode bash
+hdfs dfs -ls /logs
+
+docker exec -it spark-master bash
+spark-shell
+
+val data = sc.textFile("hdfs://namenode:9000/logs/FPT-2018-12-02.log")
+data.count()
+
+########################################################################################
+import java.text.SimpleDateFormat
+import java.util.TimeZone
+
+def record_filtered(line: String):
+Boolean = 
+{
+  val fields = line.split(" ")
+    // 6 fields <=> 7 spaces, Latency >= 0
+    // Content must be a number, Content size is positive
+    // Hit status is not '-'
+  val criteria = fields.length == 7 &&
+    fields(0).toDouble >= 0 &&
+    fields(6).forall(Character.isDigit) &&
+    fields(6).toInt > 0 &&
+    fields(2) != "-"
+  (criteria)
+}
+val record_data_filtered = data.filter(record_filtered)
+record_data_filtered.count()
+
+
+def fail_record_filtered(line: String):
+Boolean = !record_filtered(line)
+val fail_record_data_filtered = data.filter(fail_record_filtered)
+fail_record_data_filtered.count()
+
+
+def convert_to_timestamp(line: String):
+Long = 
+{
+  val fields = line.split(" ")
+  val inputData = fields(3) + " " + fields(4)
+  val timeFormat = new SimpleDateFormat("[dd/MMM/yyyy:HH:mm:ss z]")
+  timeFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
+  val timeStamp = timeFormat.parse(inputData).getTime()
+
+  timeStamp
+}
+record_data_filtered.sortBy(convert_to_timestamp).take(10).foreach(println)
+fail_record_data_filtered.sortBy(convert_to_timestamp).take(10).foreach(println)
+
+
+
+########################################################################################
+import org.apache.spark.mllib.stat.{MultivariateStatisticalSummary, Statistics}
+import org.apache.spark.mllib.linalg.Vectors
+
+def service_classified(line: String):
+String = 
+{
+  val content_name = line.split(" ")(5)
+  if (content_name.endsWith(".mpd") || content_name.endsWith(".m3u8"))
+    "HLS"
+  else if (content_name.endsWith(".dash") || content_name.endsWith(".ts"))
+    "MPEG-DASH"
+  else
+    "Web Service"
+}
+val data_classified = record_data_filtered.map(line => (service_classified(line), 1))
+val serviceGroupCounts = data_classified.reduceByKey(_ + _)
+serviceGroupCounts.collect().foreach {case (serviceGroup, count) => println(s"$serviceGroup: $count records")}
+
+
+
+def extractIP(line: String):
+String = 
+{
+  val fields = line.split(" ")(1)
+  fields
+}
+val uniqueIP = record_data_filtered.map(extractIP).distinct()
+uniqueIP.count()
+
+
+
+val dataIP = sc.textFile("hdfs://namenode:9000/logs/IPDict.csv")
+dataIP.count()
+val mapIP = dataIP.map(line => {
+  val fields = line.split(",")
+  (fields(0), (fields(1), fields(2), fields(3)))
+}).collectAsMap()
+val broadcastIP = sc.broadcast(mapIP)
+
+def log_enhanced(line: String):
+(String, (String, String, String), String, Double, String, Long) = 
+{
+  val fields = line.split(" ")
+  val ip = fields(1)
+  val info_addition = broadcastIP.value.getOrElse(ip, ("Unknown", "Unknown", "Unknown"))
+  val latency = fields(0).toDouble
+  val city = info_addition._2
+  val contentSize = fields(fields.length - 1).toLong
+  (ip, info_addition, city, latency, fields(4), contentSize)
+}
+val log_record_enhanced = record_data_filtered.map(log_enhanced)
+
+
+
+val uniqueISP = log_record_enhanced.map{case (_, (_, _, isp), _, _, _, _) => isp}.distinct().collect()
+println(s"Number of unique ISPs: ${uniqueISP.length}")
+
+val HCM_record = log_record_enhanced.filter {case (_, (_, city, _), _, _, _, _) => city == "Ho Chi Minh City"}
+println(s"Number of records in Ho Chi Minh City: ${HCM_record.count()}")
+
+val HaNoi_traffic = log_record_enhanced.filter {case (_, (_, city, _), _, _, _, _) => city == "Hanoi"}
+  .map {case (_, _, _, _, _, contentSize) => contentSize}
+  .reduce(_ + _)
+println(s"Total traffic in Hanoi: ${HaNoi_traffic}")
+
+val latency_data = log_record_enhanced.map {case (_, _, _, latency, _, _) => latency}
+val latency_vector = latency_data.map(latency => Vectors.dense(latency))
+val latency_stats: MultivariateStatisticalSummary = Statistics.colStats(latency_vector)
+println(s"Mean Latency: ${latency_stats.mean(0)}")
+println(s"Maximum Latency: ${latency_stats.max(0)}")
+println(s"Minimum Latency: ${latency_stats.min(0)}")
+
+def get_latency(line: Double): Double = line
+val latency_sorted = latency_data.sortBy(get_latency)
+val median = (latency_sorted.count() + 1)/2 - 1
+val median_value = latency_sorted.collect()(median.toInt)
+println(s"Median Latency: $median_value")
+
+val maximum_value = latency_sorted.collect()(latency_sorted.count().toInt - 1)
+val second_maximum_value = latency_sorted.collect()(latency_sorted.count().toInt - 2)
+
+
+
+
+########################################################################################
+def HIT_classified(line: String):
+String = 
+{
+  val content_name = line.split(" ")(2)
+  if (content_name.endsWith("HIT"))
+	"HIT"
+  else if (content_name.endsWith("HIT1"))
+	"HIT1"
+  else
+	"MISS"
+}
+
+val data_HIT = record_data_filtered.map(line => (HIT_classified(line), 1))
+val counts_HIT = data_HIT.reduceByKey(_ + _)
+
+val count_HIT = counts_HIT.collect().find {case (hitStatus, _) => hitStatus == "HIT"}.map(_._2).getOrElse(0)
+val count_missed = counts_HIT.collect().find {case (hitStatus, _) => hitStatus == "MISS"}.map(_._2).getOrElse(0)
+val count_HIT1 = counts_HIT.collect().find {case (hitStatus, _) => hitStatus == "HIT1"}.map(_._2).getOrElse(0)
+println(s"HIT: $count_HIT records")
+println(s"HIT1: $count_HIT1 records")
+println(s"MISS: $count_missed records")
+
+
+
+val HIT_Rate = (count_HIT + count_HIT1).toDouble / (count_HIT + count_HIT1 + count_missed).toDouble
+println(s"HIT Rate: $HIT_Rate")
+
+
+def HIT_log_enhanced(line: String):
+(String, (String, String, String), String, Double, String, Long) = 
+{
+  val fields = line.split(" ")
+  val ip = fields(1)
+  val info_addition = broadcastIP.value.getOrElse(ip, ("Unknown", "Unknown", "Unknown"))
+  val latency = fields(0).toDouble
+  val city = info_addition._2
+  val contentSize = fields(fields.length - 1).toLong
+  (ip, info_addition, city, latency, HIT_classified(line), contentSize)
+}
+val HIT_log_record_enhanced = record_data_filtered.map(HIT_log_enhanced)
+
+val map_ISP_HIT_status = HIT_log_record_enhanced.map {case (_, (_, _, isp), _, _, hitStatus, _) => (isp, hitStatus)}
+val count_ISP_HIT_status = map_ISP_HIT_status.groupByKey().mapValues(status => (status.count(_ == "HIT"), status.count(_ == "HIT1"), status.count(_ == "MISS")))
+println("ISP and HIT Status Counts:")
+count_ISP_HIT_status.collect().foreach {case (isp, (count_HIT, count_HIT1, count_missed)) => println(s"$isp: HIT = $count_HIT, HIT1 = $count_HIT1, MISS = $count_missed")}
+
+val ISP_HIT_Rate = count_ISP_HIT_status.mapValues {case (count_HIT, count_HIT1, count_missed) =>
+  val total_request = count_HIT + count_HIT1 + count_missed
+  val HIT_Rate = (count_HIT + count_HIT1).toDouble / total_request.toDouble.toDouble
+  (HIT_Rate)
+}
+println("ISP HIT Rate:")
+ISP_HIT_Rate.collect().foreach {case (isp, HIT_Rate) => println(s"$isp: ISP HIT Rate = $HIT_Rate")}
+
+
+
+val max_HIT_Rate = ISP_HIT_Rate.values.max
+val ISP_max_HIT_Rate = ISP_HIT_Rate.filter {case (_, HIT_Rate) => HIT_Rate == max_HIT_Rate}.keys
+val ISP_max_HIT_RateArr = ISP_max_HIT_Rate.collect()
+println(s"The ISPs with the maximum HIT Rate ($max_HIT_Rate) are: ${ISP_max_HIT_RateArr.mkString("\n")}")
